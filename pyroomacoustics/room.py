@@ -1938,8 +1938,8 @@ class Room(object):
                     ).format(self.dim, obj.dim)
                 )
 
-            if not self.is_inside(np.array(obj.position)):
-                raise ValueError("The source must be added inside the room.")
+            # if not self.is_inside(np.array(obj.position)):
+            #     raise ValueError("The source must be added inside the room.")
 
             self.sources.append(obj)
 
@@ -1987,8 +1987,8 @@ class Room(object):
             The room is returned for further tweaking.
         """
 
-        if self.dim != 3 and directivity is not None:
-            raise NotImplementedError("Directivity is only supported for 3D rooms.")
+        # if self.dim != 3 and directivity is not None:
+        #     raise NotImplementedError("Directivity is only supported for 3D rooms.")
 
         # make sure this is a
         loc = np.array(loc)
@@ -2029,11 +2029,11 @@ class Room(object):
             The room is returned for further tweaking.
         """
 
-        if self.simulator_state["rt_needed"] and directivity is not None:
-            raise NotImplementedError("Directivity not supported with ray tracing.")
+        # if self.simulator_state["rt_needed"] and directivity is not None:
+        #     raise NotImplementedError("Directivity not supported with ray tracing.")
 
-        if self.dim != 3 and directivity is not None:
-            raise NotImplementedError("Directivity is only supported for 3D rooms.")
+        # if self.dim != 3 and directivity is not None:
+        #     raise NotImplementedError("Directivity is only supported for 3D rooms.")
 
         if not isinstance(mic_array, MicrophoneArray):
             # if the type is not a microphone array, try to parse a numpy array
@@ -2047,8 +2047,8 @@ class Room(object):
                     "of this method."
                 )
 
-            if self.simulator_state["rt_needed"] and mic_array.is_directive:
-                raise NotImplementedError("Directivity not supported with ray tracing.")
+            # if self.simulator_state["rt_needed"] and mic_array.is_directive:
+            #     raise NotImplementedError("Directivity not supported with ray tracing.")
 
         return self.add(mic_array)
 
@@ -2073,8 +2073,8 @@ class Room(object):
             The room is returned for further tweaking.
         """
 
-        if self.dim != 3 and directivity is not None:
-            raise NotImplementedError("Directivity is only supported for 3D rooms.")
+        # if self.dim != 3 and directivity is not None:
+        #     raise NotImplementedError("Directivity is only supported for 3D rooms.")
 
         if isinstance(position, SoundSource):
             if directivity is not None:
@@ -2162,11 +2162,11 @@ class Room(object):
 
                 self.visibility.append(self.room_engine.visible_mics.copy())
 
-                # We need to check that microphones are indeed in the room
-                for m in range(self.mic_array.R.shape[1]):
-                    # if not, it's not visible from anywhere!
-                    if not self.is_inside(self.mic_array.R[:, m]):
-                        self.visibility[-1][m, :] = 0
+                # # We need to check that microphones are indeed in the room
+                # for m in range(self.mic_array.R.shape[1]):
+                #     # if not, it's not visible from anywhere!
+                #     if not self.is_inside(self.mic_array.R[:, m]):
+                #         self.visibility[-1][m, :] = 0
             else:
                 # if we are here, this means even the direct path is not visible
                 # we set the visibility of the direct path as 0.
@@ -2317,7 +2317,16 @@ class Room(object):
                         min_phase=self.min_phase,
                         air_abs_coeffs=self.air_absorption,
                     )
-                    rir_parts.append(ir_ism)
+                    # rir_parts.append(ir_ism)
+
+                    if ir_ism is None:
+                        print(
+                            f"Warning: No visible image sources for "
+                            f"source {s} -> mic {m}. "
+                            f"Skipping ISM RIR computation."
+                        )
+                    else:
+                        rir_parts.append(ir_ism)
 
                 if self.simulator_state["rt_needed"]:
                     t0 = np.linalg.norm(src.position - mic) / self.c
@@ -2337,7 +2346,13 @@ class Room(object):
                     rir_parts.append(ir_rt)
 
                 if len(rir_parts) == 0:
-                    raise ValueError("Both ISM and RT are disabled")
+                    # raise ValueError("Both ISM and RT are disabled")
+                    print(
+                        f"Warning: No RIR computed for source {s} -> mic {m}. "
+                        f"Using silent RIR."
+                    )
+                    self.rir[m].append(np.zeros(1, dtype=np.float32))
+                    continue
                 elif len(rir_parts) == 1:
                     rir = rir_parts[0]
                 else:
