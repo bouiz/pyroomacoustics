@@ -58,6 +58,11 @@ class Wall
     Eigen::ArrayXf scatter;  // the wall scattering coefficient for every freq. band
     float average_scatter;  // the average scattering coefficient accross all subbands
     bool does_scatter = false;  // flag that indicates that the wall has non-zero scattering
+    // Two-sided walls reflect image sources from both half-spaces. Use for thin
+    // single surfaces (free-standing panels, single-sheet partitions) whose
+    // both faces are exposed to the air. One-sided walls (the default) only
+    // reflect sources lying behind their normal, i.e. inside the room.
+    bool two_sided = false;
     std::string name;
     Eigen::ArrayXf transmission;  // computed from absorption as sqrt(1 - a)
     Eigen::ArrayXf energy_reflection;  // computed from absorption as (1 - a)
@@ -87,7 +92,7 @@ class Wall
     // Copy constructor
     Wall(const Wall<D> &w) :
       absorption(w.absorption), scatter(w.scatter), average_scatter(w.average_scatter),
-      does_scatter(w.does_scatter), name(w.name), transmission(w.transmission),
+      does_scatter(w.does_scatter), two_sided(w.two_sided), name(w.name), transmission(w.transmission),
       energy_reflection(w.energy_reflection), normal(w.normal), corners(w.corners),
       origin(w.origin), basis(w.basis), flat_corners(w.flat_corners)
     {}

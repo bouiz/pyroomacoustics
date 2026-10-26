@@ -190,6 +190,9 @@ int Room<D>::image_source_model(const Vectorf<D> &source_location) {
   // make sure the list is empty
   while (visible_sources.size() > 0) visible_sources.pop();
 
+  // reset the progress counter for this source
+  ism_nodes_visited = 0;
+
   if (is_shoebox) {
     return image_source_shoebox(source_location);
   } else {
@@ -246,6 +249,13 @@ void Room<D>::image_sources_dfs(ImageSource<D> &is, int max_order) {
    * This function runs a depth first search (DFS) on the tree of image sources
    */
 
+  // live progress: count visited nodes and periodically notify the callback
+  ++ism_nodes_visited;
+  if (ism_progress_callback && ism_progress_stride > 0 &&
+      (ism_nodes_visited % ism_progress_stride) == 0) {
+    ism_progress_callback(ism_nodes_visited, visible_sources.size());
+  }
+
   ImageSource<D> new_is(n_bands, microphones.size());
 
   // Check the visibility of the source from the different microphones
@@ -272,8 +282,14 @@ void Room<D>::image_sources_dfs(ImageSource<D> &is, int max_order) {
     int dir = walls[wi].reflect(is.loc, new_is.loc);  // the reflected location
 
     // We only check valid reflections (normals should point outward from the
-    // room
-    if (dir <= 0) continue;
+    // room). Two-sided walls reflect sources lying on either side.
+    if (dir == 0 || (dir < 0 && !walls[wi].two_sided)) continue;
+
+    // Reflecting twice in a row across the same wall maps the image back onto
+    // its grand-parent. For one-sided walls the side test above already rules
+    // this out; for two-sided walls it would create a bogus "reflection" that
+    // is really the direct path transmitted through the surface.
+    if (static_cast<int>(wi) == is.gen_wall) continue;
 
     // The reflection is valid, fill in the image source attributes
     new_is.attenuation = is.attenuation * walls[wi].get_transmission();
@@ -920,13 +936,21 @@ void Room<D>::simul_ray(const Vectorf<D> &ray_direction,
     // set up for next iteration
     specular_counter += 1;
 
+    // Which side of the wall the ray arrived from: true when it travelled
+    // along the normal, i.e. it hit the wall's interior (back) face.
+    bool hit_from_back = dir.dot(wall.normal) > 0.f;
+
     dir = wall.normal_reflect(dir);  // conserves length
 
     if (wall.does_scatter)
     {
-      // Compute the scattered direction.
-      // We inverse the direction because the wall normal is pointing outward.
-      Vectorf<D> scat_dir = -wall.sample_lambertian_reflection();
+      // Compute the scattered direction. The Lambertian lobe is sampled around
+      // the wall normal, so it must be mirrored into the half-space the ray
+      // came from. Upstream always negated it (assuming outward normals and an
+      // interior hit); that sends scattered energy THROUGH any wall hit from
+      // its normal side (flipped or two-sided walls) and leaks the room.
+      Vectorf<D> scat_dir = wall.sample_lambertian_reflection();
+      if (hit_from_back) scat_dir = -scat_dir;
       dir = wall.average_scatter * scat_dir + (1.f - wall.average_scatter) * dir;
       dir = dir.normalized();
     }

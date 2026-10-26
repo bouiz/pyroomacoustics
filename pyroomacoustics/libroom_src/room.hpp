@@ -29,6 +29,7 @@
 #include <vector>
 #include <stack>
 #include <tuple>
+#include <functional>
 #include <Eigen/Dense>
 #include <algorithm>
 #include <ctime>
@@ -95,6 +96,13 @@ class Room
 
     // Simulation parameters
     int ism_order = 0.;
+
+    // Optional per-node progress callback for the image-source model DFS.
+    // Invoked as callback(nodes_visited, image_sources_found) every
+    // `ism_progress_stride` visited nodes. Used to report live progress.
+    std::function<void(size_t, size_t)> ism_progress_callback;
+    size_t ism_nodes_visited = 0;
+    size_t ism_progress_stride = 100000;
 
     // Ray tracing parameters
     float energy_thres = 1e-7;
@@ -275,6 +283,13 @@ class Room
         );
 
     bool contains(const Vectorf<D> point);
+
+    // Install (or clear, with an empty function) the image-source DFS progress
+    // callback. See `ism_progress_callback`.
+    void set_ism_progress_callback(std::function<void(size_t, size_t)> cb)
+    {
+      ism_progress_callback = std::move(cb);
+    }
 
   private:
     // We need a stack to store the image sources during the algorithm

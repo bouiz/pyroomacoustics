@@ -66,6 +66,17 @@ PYBIND11_MODULE(libroom, m) {
       .def("reset_mics", &Room<3>::reset_mics)
       .def("broadcast_bands_to", &Room<3>::broadcast_bands_to)
       .def("image_source_model", &Room<3>::image_source_model)
+      .def("image_source_model",
+           [](Room<3> &r, const Vectorf<3> &pos, py::function cb) {
+             r.set_ism_progress_callback([cb](size_t n, size_t s) {
+               py::gil_scoped_acquire acquire;
+               cb(py::int_(n), py::int_(s));
+             });
+             int res = r.image_source_model(pos);
+             r.set_ism_progress_callback(nullptr);
+             return res;
+           },
+           py::arg("source_location"), py::arg("progress_callback"))
       .def("get_wall", &Room<3>::get_wall)
       .def("get_max_distance", &Room<3>::get_max_distance)
       .def("next_wall_hit", &Room<3>::next_wall_hit)
@@ -129,6 +140,17 @@ PYBIND11_MODULE(libroom, m) {
       .def("reset_mics", &Room<2>::reset_mics)
       .def("broadcast_bands_to", &Room<2>::broadcast_bands_to)
       .def("image_source_model", &Room<2>::image_source_model)
+      .def("image_source_model",
+           [](Room<2> &r, const Vectorf<2> &pos, py::function cb) {
+             r.set_ism_progress_callback([cb](size_t n, size_t s) {
+               py::gil_scoped_acquire acquire;
+               cb(py::int_(n), py::int_(s));
+             });
+             int res = r.image_source_model(pos);
+             r.set_ism_progress_callback(nullptr);
+             return res;
+           },
+           py::arg("source_location"), py::arg("progress_callback"))
       .def("get_wall", &Room<2>::get_wall)
       .def("get_max_distance", &Room<2>::get_max_distance)
       .def("next_wall_hit", &Room<2>::next_wall_hit)
@@ -205,6 +227,7 @@ PYBIND11_MODULE(libroom, m) {
       .def_readwrite("absorption", &Wall<3>::absorption)
       .def_readwrite("scatter", &Wall<3>::scatter)
       .def_readwrite("name", &Wall<3>::name)
+      .def_readwrite("two_sided", &Wall<3>::two_sided)
       .def_readonly("corners", &Wall<3>::corners)
       .def_readonly("origin", &Wall<3>::origin)
       .def_readonly("normal", &Wall<3>::normal)
@@ -247,6 +270,7 @@ PYBIND11_MODULE(libroom, m) {
       .def_readwrite("absorption", &Wall<2>::absorption)
       .def_readwrite("scatter", &Wall<2>::scatter)
       .def_readwrite("name", &Wall<2>::name)
+      .def_readwrite("two_sided", &Wall<2>::two_sided)
       .def_readonly("corners", &Wall<2>::corners)
       .def_readonly("origin", &Wall<2>::origin)
       .def_readonly("normal", &Wall<2>::normal)

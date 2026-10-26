@@ -730,6 +730,17 @@ from .simulation import compute_ism_rir, compute_rt_rir
 from .soundsource import SoundSource
 from .utilities import design_highpass_filter_sos
 
+# Number of progress updates emitted per source while ray tracing. Ray tracing
+# is normally the dominant cost of a simulation; splitting each source's rays
+# into this many contiguous batches lets an optional progress callback observe
+# it in real time. Energy normalization is preserved exactly (see ray_tracing).
+RAY_TRACE_PROGRESS_CHUNKS = 20
+
+# The image-source DFS has no known total, so live progress uses a saturating
+# curve: fraction -> 1 - 1 / (1 + nodes / ISM_PROGRESS_SCALE). Tune to make the
+# bar move visibly for typical node counts.
+ISM_PROGRESS_SCALE = 2.0e6
+
 
 def wall_factory(corners, absorption, scattering, name=""):
     """Call the correct method according to wall dimension"""
@@ -741,14 +752,33 @@ def wall_factory(corners, absorption, scattering, name=""):
         raise ValueError("Rooms can only be 2D or 3D")
 
 
-def find_non_convex_walls(walls):
+# Relative tolerance (fraction of the room's bounding-box diagonal) used to
+# decide whether a wall lies in a supporting plane of the convex hull. Wall
+# corners are stored in float32 and real models carry modelling noise, so an
+# absolute epsilon on an un-normalized cross product (upstream behaviour) marks
+# most walls of any rotated / offset room as "obstructing".
+NON_CONVEX_WALL_REL_TOL = 1e-5
+
+# Number of wall centroids tested against the hull facets per vectorized batch
+# (bounds the temporary [batch x n_facets] distance matrix).
+NON_CONVEX_WALL_BATCH = 2048
+
+
+def find_non_convex_walls(walls, rel_tol=NON_CONVEX_WALL_REL_TOL):
     """
     Finds the walls that are not in the convex hull
+
+    A wall is "on the hull" when it lies in a supporting plane of the convex
+    hull of all wall corners. Such walls can never obstruct a segment joining
+    two points of the room, so only the remaining (non-convex) walls are
+    checked for obstruction by the image source model and the ray tracer.
 
     Parameters
     ----------
     walls: list of Wall objects
         The walls that compose the room
+    rel_tol: float
+        Plane-distance tolerance, relative to the bounding-box diagonal
 
     Returns
     -------
@@ -756,41 +786,35 @@ def find_non_convex_walls(walls):
         The indices of the walls no in the convex hull
     """
 
-    all_corners = []
-    for wall in walls[1:]:
-        all_corners.append(wall.corners.T)
-    X = np.concatenate(all_corners, axis=0)
-    convex_hull = spatial.ConvexHull(X, incremental=True)
+    if len(walls) == 0:
+        return []
 
-    # Now we need to check which walls are on the surface
-    # of the hull
-    in_convex_hull = [False] * len(walls)
-    for i, wall in enumerate(walls):
-        # We check if the center of the wall is co-linear or co-planar
-        # with a face of the convex hull
-        point = np.mean(wall.corners, axis=1)
+    X = np.concatenate(
+        [np.asarray(wall.corners, dtype=np.float64).T for wall in walls], axis=0
+    )
+    centroids = np.array(
+        [np.asarray(wall.corners, dtype=np.float64).mean(axis=1) for wall in walls]
+    )
+    diag = float(np.linalg.norm(X.max(axis=0) - X.min(axis=0)))
+    tol = max(rel_tol * diag, 10 * eps)
 
-        for simplex in convex_hull.simplices:
-            if point.shape[0] == 2:
-                # check if co-linear
-                p0 = convex_hull.points[simplex[0]]
-                p1 = convex_hull.points[simplex[1]]
-                if libroom.ccw3p(p0, p1, point) == 0:
-                    # co-linear point add to hull
-                    in_convex_hull[i] = True
+    try:
+        convex_hull = spatial.ConvexHull(X)
+    except spatial.QhullError:
+        # Degenerate (flat / collinear) geometry: every wall lies on the hull.
+        return []
 
-            elif point.shape[0] == 3:
-                # Check if co-planar
-                p0 = convex_hull.points[simplex[0]]
-                p1 = convex_hull.points[simplex[1]]
-                p2 = convex_hull.points[simplex[2]]
+    # Hull facets as unit-normal plane equations: n . x + d <= 0 inside.
+    normals = convex_hull.equations[:, :-1]
+    offsets = convex_hull.equations[:, -1]
 
-                normal = np.cross(p1 - p0, p2 - p0)
-                if np.abs(np.inner(normal, point - p0)) < eps:
-                    # co-planar point found!
-                    in_convex_hull[i] = True
+    in_convex_hull = np.zeros(len(walls), dtype=bool)
+    for a in range(0, len(walls), NON_CONVEX_WALL_BATCH):
+        c = centroids[a : a + NON_CONVEX_WALL_BATCH]
+        dist = np.abs(c @ normals.T + offsets[None, :])
+        in_convex_hull[a : a + NON_CONVEX_WALL_BATCH] = dist.min(axis=1) <= tol
 
-    return [i for i in range(len(walls)) if not in_convex_hull[i]]
+    return [int(i) for i in np.flatnonzero(~in_convex_hull)]
 
 
 class Room(object):
@@ -2114,14 +2138,50 @@ class Room(object):
             sndsrc.set_directivity(directivity)
         return self.add(sndsrc)
 
-    def image_source_model(self):
+    def _emit_progress(self, callback, fraction, text):
+        """Report progress to an optional callback. Never raises."""
+        if callback is None:
+            return
+        try:
+            callback(max(0.0, min(1.0, float(fraction))), text)
+        except Exception:
+            pass
+
+    def image_source_model(self, progress_callback=None):
         if not self.simulator_state["ism_needed"]:
             return
 
         self.visibility = []
 
-        for source in self.sources:
-            n_visible_sources = self.room_engine.image_source_model(source.position)
+        n_sources = len(self.sources)
+        for source_index, source in enumerate(self.sources):
+            base = 0.15 * source_index / max(1, n_sources)
+            span = 0.15 / max(1, n_sources)
+
+            if progress_callback is not None:
+                # Live progress from the C++ image-source DFS. The total number
+                # of nodes is not known in advance, so the fraction saturates
+                # towards the end of this source's ISM sub-band; the exact
+                # boundary is emitted once the DFS returns (see below).
+                def _ism_engine_cb(nodes, found, _base=base, _span=span,
+                                   _i=source_index, _n=n_sources):
+                    frac = _base + _span * (
+                        1.0 - 1.0 / (1.0 + nodes / ISM_PROGRESS_SCALE)
+                    )
+                    self._emit_progress(
+                        progress_callback,
+                        frac,
+                        f"Image source model {_i + 1}/{_n}: "
+                        f"{nodes:,} candidate paths, {found:,} found",
+                    )
+
+                n_visible_sources = self.room_engine.image_source_model(
+                    source.position, _ism_engine_cb
+                )
+            else:
+                n_visible_sources = self.room_engine.image_source_model(
+                    source.position
+                )
 
             if n_visible_sources > 0:
                 # Copy to python managed memory
@@ -2177,10 +2237,17 @@ class Room(object):
                     (self.mic_array.M, self.dim, 1), dtype=np.float32
                 )
 
+            self._emit_progress(
+                progress_callback,
+                0.15 * (source_index + 1) / max(1, n_sources),
+                f"Image sources {source_index + 1}/{n_sources} "
+                f"({n_visible_sources} found)",
+            )
+
         # Update the state
         self.simulator_state["ism_done"] = True
 
-    def ray_tracing(self):
+    def ray_tracing(self, progress_callback=None):
         if not self.simulator_state["rt_needed"]:
             return
 
@@ -2230,6 +2297,8 @@ class Room(object):
         # shape (n_mics, n_src, n_directions, n_bands, n_time_bins)
         self.rt_histograms = [[] for r in range(self.mic_array.M)]
 
+        n_sources = len(self.sources)
+
         for s, src in enumerate(self.sources):
             # Create the directivity pattern if needed.
             if src.directivity is None:
@@ -2241,9 +2310,29 @@ class Room(object):
 
             # Run the ray tracing.
             if self.dim == 3:
-                self.room_engine.ray_tracing(
-                    source_directions, source_energies, src.position
-                )
+                # Split the rays into contiguous batches so an optional progress
+                # callback can observe the (dominant) ray-tracing step in real
+                # time. The C++ routine normalizes the initial energy by the
+                # number of rays it is given, so each batch is rescaled by
+                # (batch / total) to preserve the exact ENERGY_0 / n total.
+                dirs = np.ascontiguousarray(source_directions)
+                ens = np.asarray(source_energies, dtype=np.float32)
+                n_total = dirs.shape[0]
+                n_chunks = max(1, min(RAY_TRACE_PROGRESS_CHUNKS, n_total))
+                bounds = np.linspace(0, n_total, n_chunks + 1).astype(int)
+                for chunk_index in range(n_chunks):
+                    a, b = int(bounds[chunk_index]), int(bounds[chunk_index + 1])
+                    if b <= a:
+                        continue
+                    self.room_engine.ray_tracing(
+                        dirs[a:b], ens[a:b] * ((b - a) / n_total), src.position
+                    )
+                    self._emit_progress(
+                        progress_callback,
+                        0.15 + 0.70 * ((s + b / n_total) / max(1, n_sources)),
+                        f"Ray tracing source {s + 1}/{n_sources} "
+                        f"({b}/{n_total} rays)",
+                    )
             elif self.dim == 2:
                 if is_all_omni:
                     self.room_engine.ray_tracing(n_rays, src.position)
@@ -2263,19 +2352,34 @@ class Room(object):
             # reset all the receivers' histograms
             self.room_engine.reset_mics()
 
+            if self.dim != 3:
+                # The 2D path is not chunked; still report per-source progress.
+                self._emit_progress(
+                    progress_callback,
+                    0.15 + 0.70 * ((s + 1) / max(1, n_sources)),
+                    f"Ray tracing source {s + 1}/{n_sources}",
+                )
+
         # update the state
         self.simulator_state["rt_done"] = True
 
-    def compute_rir(self):
+    def compute_rir(self, progress_callback=None):
         """
         Compute the room impulse response between every source and microphone.
+
+        Parameters
+        ----------
+        progress_callback: callable, optional
+            Called as ``callback(fraction, text)`` with ``fraction`` in [0, 1]
+            at coarse milestones and, during ray tracing, once per batch of
+            rays. Exceptions raised by the callback are ignored.
         """
 
         if self.simulator_state["ism_needed"] and not self.simulator_state["ism_done"]:
-            self.image_source_model()
+            self.image_source_model(progress_callback=progress_callback)
 
         if self.simulator_state["rt_needed"] and not self.simulator_state["rt_done"]:
-            self.ray_tracing()
+            self.ray_tracing(progress_callback=progress_callback)
 
         # If the RIR highpass filter is enabled, compute the coefficients.
         rir_hpf_sos = None
@@ -2290,6 +2394,9 @@ class Room(object):
 
         # Loop over ever microphone present in the room and then for each
         # microphone and source pair present in the room
+        n_pairs = max(1, self.mic_array.M * len(self.sources))
+        pair_counter = 0
+
         for m, mic in enumerate(self.mic_array.R.T):
             self.rir.append([])
             for s, src in enumerate(self.sources):
@@ -2352,6 +2459,12 @@ class Room(object):
                         f"Using silent RIR."
                     )
                     self.rir[m].append(np.zeros(1, dtype=np.float32))
+                    self._emit_progress(
+                        progress_callback,
+                        0.85 + 0.15 * pair_counter / n_pairs,
+                        f"Building RIR {pair_counter + 1}/{n_pairs}",
+                    )
+                    pair_counter += 1
                     continue
                 elif len(rir_parts) == 1:
                     rir = rir_parts[0]
@@ -2366,6 +2479,12 @@ class Room(object):
                     rir = np.ascontiguousarray(sosfiltfilt(rir_hpf_sos, rir))
 
                 self.rir[m].append(rir)
+                self._emit_progress(
+                    progress_callback,
+                    0.85 + 0.15 * pair_counter / n_pairs,
+                    f"Building RIR {pair_counter + 1}/{n_pairs}",
+                )
+                pair_counter += 1
 
         self.simulator_state["rir_done"] = True
 

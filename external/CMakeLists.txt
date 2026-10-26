@@ -5,6 +5,8 @@ FetchContent_Declare(
   eigen
   GIT_REPOSITORY https://gitlab.com/libeigen/eigen
   GIT_TAG 5.0.1
+  GIT_SHALLOW TRUE
+  GIT_PROGRESS TRUE
 )
 
 # nanoflann
@@ -12,6 +14,8 @@ FetchContent_Declare(
   nanoflann
   GIT_REPOSITORY https://github.com/jlblancoc/nanoflann
   GIT_TAG v1.9.0
+  GIT_SHALLOW TRUE
+  GIT_PROGRESS TRUE
 )
 
 # pybind11
@@ -19,6 +23,8 @@ FetchContent_Declare(
   pybind11
   GIT_REPOSITORY https://github.com/pybind/pybind11
   GIT_TAG v3.0.1
+  GIT_SHALLOW TRUE
+  GIT_PROGRESS TRUE
 )
 
 # eigen
