@@ -32,11 +32,11 @@ from pathlib import Path
 import numpy as np
 
 try:
-    import sofa
+    import h5py
 
-    has_sofa = True
+    has_h5py = True
 except ImportError:
-    has_sofa = False
+    has_h5py = False
 
 
 from ..datasets.sofa import get_sofa_db, is_dirpat, resolve_sofa_path
@@ -83,38 +83,39 @@ def open_sofa_file(path, fs=16000):
     # I 	singleton dimension, constant 	always 1
     # C 	coordinate triplet, constant 	always 3
 
-    # Open DirPat database
-    if not has_sofa:
+    if not has_h5py:
         raise ValueError(
-            "The package 'python-sofa' needs to be installed to call this function. Install by doing `pip install python-sofa`"
+            "The package 'h5py' needs to be installed to read SOFA files. Install by doing `pip install h5py`"
         )
 
     sofa_db = get_sofa_db()
 
     path = resolve_sofa_path(path)
 
-    file_sofa = sofa.Database.open(path)
-
-    # we have a special case for DIRPAT files because they need surgery
-    if is_dirpat(path):
-        # special case for DIRPAT files
-        # this is needed because the DIRPAT files are not following the SOFA conventions
-        # and require some custom processing
-        ir, fs, src_loc, mic_loc = _read_dirpat(file_sofa, path.stem, fs)
-
-    else:
-        # readers for SOFA files following the conventions
-
-        conv_name = file_sofa.convention.name
-
-        if conv_name == "SimpleFreeFieldHRIR":
-            ir, fs, src_loc, mic_loc = _read_simple_free_field_hrir(file_sofa, fs)
-
-        elif conv_name == "GeneralFIR":
-            ir, fs, src_loc, mic_loc = _read_general_fir(file_sofa, fs)
+    file_sofa = _H5SofaFile(path)
+    try:
+        # we have a special case for DIRPAT files because they need surgery
+        if is_dirpat(path):
+            # special case for DIRPAT files
+            # this is needed because the DIRPAT files are not following the SOFA conventions
+            # and require some custom processing
+            ir, fs, src_loc, mic_loc = _read_dirpat(file_sofa, path.stem, fs)
 
         else:
-            raise NotImplementedError(f"SOFA convention {conv_name} not implemented")
+            # readers for SOFA files following the conventions
+
+            conv_name = file_sofa.convention.name
+
+            if conv_name == "SimpleFreeFieldHRIR":
+                ir, fs, src_loc, mic_loc = _read_simple_free_field_hrir(file_sofa, fs)
+
+            elif conv_name == "GeneralFIR":
+                ir, fs, src_loc, mic_loc = _read_general_fir(file_sofa, fs)
+
+            else:
+                raise NotImplementedError(f"SOFA convention {conv_name} not implemented")
+    finally:
+        file_sofa.close()
 
     # assign the source labels if known
     source_labels = None
@@ -141,6 +142,64 @@ def open_sofa_file(path, fs=16000):
                 )
 
     return ir, fs, src_loc, mic_loc, source_labels, mic_labels
+
+
+def _decode(value):
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+class _H5SofaVariable:
+    """A SOFA variable read with h5py (the API of python-sofa's variables used here)."""
+
+    def __init__(self, dataset):
+        self._ds = dataset
+
+    def get_values(self):
+        # Raw values: netCDF fill values and packing (scale_factor / add_offset)
+        # are not applied. SOFA directivity files use neither.
+        return np.asarray(self._ds[()])
+
+    def dimensions(self):
+        # netCDF4 attaches one dimension scale per axis, named after the SOFA
+        # dimension ("/M", "/R", "/C", ...)
+        names = []
+        for axis in self._ds.dims:
+            names.append(axis[0].name.split("/")[-1] if len(axis) else axis.label)
+        return tuple(names)
+
+    @property
+    def Units(self):
+        return _decode(self._ds.attrs["Units"])
+
+    @property
+    def Type(self):
+        return _decode(self._ds.attrs["Type"])
+
+
+class _H5SofaFile:
+    """
+    Read-only view of a SOFA file (netCDF4, i.e. HDF5) through h5py, exposing the
+    attributes of ``sofa.Database`` (python-sofa) that the readers below use.
+    """
+
+    def __init__(self, path):
+        self._file = h5py.File(path, "r")
+        f = self._file
+        self.convention = _Namespace(name=_decode(f.attrs["SOFAConventions"]))
+        self.Data = _Namespace(
+            IR=_H5SofaVariable(f["Data.IR"]),
+            SamplingRate=_H5SofaVariable(f["Data.SamplingRate"]),
+        )
+        self.Source = _Namespace(Position=_H5SofaVariable(f["SourcePosition"]))
+        self.Receiver = _Namespace(Position=_H5SofaVariable(f["ReceiverPosition"]))
+
+    def close(self):
+        self._file.close()
+
+
+class _Namespace:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 def _parse_locations(sofa_pos, target_format):

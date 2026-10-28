@@ -727,6 +727,7 @@ from .experimental import measure_rt60
 from .libroom import Wall, Wall2D
 from .parameters import Material, Physics, constants, eps, make_materials
 from .simulation import compute_ism_rir, compute_rt_rir
+from .simulation import rt_parallel
 from .soundsource import SoundSource
 from .utilities import design_highpass_filter_sos
 
@@ -888,7 +889,14 @@ class Room(object):
     min_phase: bool, optional
         If set to True, generated RIRs will have a minimum phase response.
         Cannot be used with ray tracing model.
+
+    :attribute check_inside: (bool) reject sources added outside the room and
+        make microphones outside it hear nothing (upstream behaviour). Off by
+        default: architectural meshes are often open, where the inside test
+        is unreliable. Set it on an instance before adding sources/microphones.
     """
+
+    check_inside = False
 
     def __init__(
         self,
@@ -1019,6 +1027,10 @@ class Room(object):
     def _init_room_engine(self, *args):
         args = list(args)
 
+        # Polygonal rooms can be rebuilt in other processes from their walls
+        # (multi-process ray tracing); shoebox rooms cannot.
+        self._engine_is_polygon = len(args) == 0
+
         if len(args) == 0:
             # This is a polygonal room
             # find the non convex walls
@@ -1039,6 +1051,9 @@ class Room(object):
             self.rt_args["hist_bin_size"],
             self.simulator_state["ism_needed"] and self.simulator_state["rt_needed"],
         ]
+
+        # Kept to build throw-away engines (ray tracing with shared receivers)
+        self._engine_args = list(args)
 
         # Create the real room object
         if self.dim == 2:
@@ -1078,6 +1093,8 @@ class Room(object):
         time_thres=10.0,
         hist_bin_size=0.004,
         receiver_n_directions=720,
+        n_processes=1,
+        share_coincident_mics=True,
     ):
         """
         Activates the ray tracer.
@@ -1098,6 +1115,17 @@ class Room(object):
         receiver_n_directions: int
             The number of directions to use to collect the histograms of directional
             receivers.
+        n_processes: int
+            Number of worker processes the rays of each source are split across
+            (default: 1, i.e. everything in this process). Only polygonal 3D
+            rooms are traced in parallel. The result is statistically
+            equivalent to a single process; it is not bit-identical to it.
+        share_coincident_mics: bool
+            Trace microphones that sit at the same position and collect the same
+            direction grid (the channels of an ambisonic microphone, for
+            instance) as one receiver and give all of them its histograms
+            (default: True). The receiver cost of ray tracing is then paid once
+            per position instead of once per channel.
         """
         self._set_ray_tracing_options(
             use_ray_tracing=True,
@@ -1107,6 +1135,8 @@ class Room(object):
             time_thres=time_thres,
             hist_bin_size=hist_bin_size,
             receiver_n_directions=receiver_n_directions,
+            n_processes=n_processes,
+            share_coincident_mics=share_coincident_mics,
         )
 
     def _set_ray_tracing_options(
@@ -1119,6 +1149,8 @@ class Room(object):
         hist_bin_size=0.004,
         receiver_n_directions=720,
         is_init=False,
+        n_processes=1,
+        share_coincident_mics=True,
     ):
         """
         Base method to set all ray tracing related options
@@ -1127,6 +1159,8 @@ class Room(object):
         self.simulator_state["rt_needed"] = use_ray_tracing
 
         self.rt_args = {}
+        self.rt_args["n_processes"] = max(1, int(n_processes))
+        self.rt_args["share_coincident_mics"] = bool(share_coincident_mics)
         self.rt_args["energy_thres"] = energy_thres
         self.rt_args["time_thres"] = time_thres
         self.rt_args["receiver_radius"] = receiver_radius
@@ -1962,8 +1996,8 @@ class Room(object):
                     ).format(self.dim, obj.dim)
                 )
 
-            # if not self.is_inside(np.array(obj.position)):
-            #     raise ValueError("The source must be added inside the room.")
+            if self.check_inside and not self.is_inside(np.array(obj.position)):
+                raise ValueError("The source must be added inside the room.")
 
             self.sources.append(obj)
 
@@ -2222,11 +2256,11 @@ class Room(object):
 
                 self.visibility.append(self.room_engine.visible_mics.copy())
 
-                # # We need to check that microphones are indeed in the room
-                # for m in range(self.mic_array.R.shape[1]):
-                #     # if not, it's not visible from anywhere!
-                #     if not self.is_inside(self.mic_array.R[:, m]):
-                #         self.visibility[-1][m, :] = 0
+                # A microphone outside the room hears nothing
+                if self.check_inside:
+                    for m in range(self.mic_array.R.shape[1]):
+                        if not self.is_inside(self.mic_array.R[:, m]):
+                            self.visibility[-1][m, :] = 0
             else:
                 # if we are here, this means even the direct path is not visible
                 # we set the visibility of the direct path as 0.
@@ -2266,11 +2300,29 @@ class Room(object):
 
         # For directive microphones, we need to enable direction sensitive receivers.
         default_directions = fibonacci_spherical_sampling(n_dirs).T
+
+        # Microphones at the same position that collect the same direction grid
+        # (the channels of an ambisonic microphone, e.g.) are traced as ONE
+        # receiver: every ray/receiver test is paid once, not once per channel.
+        receiver_of_mic, n_receivers = self._rt_receiver_groups()
+        if n_receivers == self.mic_array.M:
+            engine = self.room_engine
+        else:
+            engine = (libroom.Room2D if self.dim == 2 else libroom.Room)(
+                *self._engine_args
+            )
+            added = set()
+            for r in range(self.mic_array.M):
+                if receiver_of_mic[r] not in added:
+                    added.add(receiver_of_mic[r])
+                    engine.add_mic(self.mic_array.R[:, None, r])
+
+        receivers = [None] * n_receivers  # (location, direction grid or None) per receiver
         self.rt_directional_responses = []
         for r, directivity in enumerate(self.mic_array.directivity):
             if directivity is None:
                 # When no directivity is provided, the microphones are omnidirectional.
-                self.room_engine.microphones[r].make_omnidirectional()
+                dir_vectors = None
                 self.rt_directional_responses.append(
                     {
                         "response": np.ones(1),
@@ -2285,13 +2337,24 @@ class Room(object):
                 else:
                     # Otherwise, we use the default directions.
                     dir_vectors = default_directions
-                self.room_engine.microphones[r].set_directions(dir_vectors)
                 self.rt_directional_responses.append(
                     {
                         "response": directivity.get_response_cartesian(dir_vectors),
                         "is_impulse_response": directivity.is_impulse_response,
                     }
                 )
+            e = receiver_of_mic[r]
+            if receivers[e] is None:
+                receivers[e] = (np.array(self.mic_array.R[:, r]), dir_vectors)
+                if dir_vectors is None:
+                    engine.microphones[e].make_omnidirectional()
+                else:
+                    engine.microphones[e].set_directions(dir_vectors)
+
+        # Rays of each source can be split over several processes.
+        n_processes = int(self.rt_args.get("n_processes", 1))
+        engine_spec = rt_parallel.build_engine_spec(self) if n_processes > 1 else None
+        n_seeds = n_processes * rt_parallel.SLICES_PER_PROCESS
 
         # this will be a list of lists with
         # shape (n_mics, n_src, n_directions, n_bands, n_time_bins)
@@ -2309,6 +2372,7 @@ class Room(object):
                 source_energies = np.broadcast_to(source_energies, (n_rays, n_bands))
 
             # Run the ray tracing.
+            histograms = None  # per receiver: list of per-direction histograms
             if self.dim == 3:
                 # Split the rays into contiguous batches so an optional progress
                 # callback can observe the (dominant) ray-tracing step in real
@@ -2318,24 +2382,59 @@ class Room(object):
                 dirs = np.ascontiguousarray(source_directions)
                 ens = np.asarray(source_energies, dtype=np.float32)
                 n_total = dirs.shape[0]
-                n_chunks = max(1, min(RAY_TRACE_PROGRESS_CHUNKS, n_total))
-                bounds = np.linspace(0, n_total, n_chunks + 1).astype(int)
-                for chunk_index in range(n_chunks):
-                    a, b = int(bounds[chunk_index]), int(bounds[chunk_index + 1])
-                    if b <= a:
-                        continue
-                    self.room_engine.ray_tracing(
-                        dirs[a:b], ens[a:b] * ((b - a) / n_total), src.position
-                    )
-                    self._emit_progress(
-                        progress_callback,
-                        0.15 + 0.70 * ((s + b / n_total) / max(1, n_sources)),
-                        f"Ray tracing source {s + 1}/{n_sources} "
-                        f"({b}/{n_total} rays)",
-                    )
+
+                if (
+                    engine_spec is not None
+                    and n_total >= 2 * rt_parallel.MIN_RAYS_PER_PROCESS
+                ):
+
+                    def _parallel_progress(done, total, _s=s):
+                        self._emit_progress(
+                            progress_callback,
+                            0.15 + 0.70 * ((_s + done / total) / max(1, n_sources)),
+                            f"Ray tracing source {_s + 1}/{n_sources} "
+                            f"({done}/{total} rays, {n_processes} processes)",
+                        )
+
+                    try:
+                        histograms = rt_parallel.trace_parallel(
+                            engine_spec,
+                            receivers,
+                            dirs,
+                            ens,
+                            src.position,
+                            n_processes,
+                            random.get_rng().integers(
+                                0, 2**62, size=n_seeds, dtype=np.int64
+                            ),
+                            progress=_parallel_progress,
+                        )
+                    except Exception as exc:
+                        warnings.warn(
+                            f"Multi-process ray tracing failed ({exc!r}); "
+                            "tracing this source in the current process."
+                        )
+                        histograms = None
+
+                if histograms is None:
+                    n_chunks = max(1, min(RAY_TRACE_PROGRESS_CHUNKS, n_total))
+                    bounds = np.linspace(0, n_total, n_chunks + 1).astype(int)
+                    for chunk_index in range(n_chunks):
+                        a, b = int(bounds[chunk_index]), int(bounds[chunk_index + 1])
+                        if b <= a:
+                            continue
+                        engine.ray_tracing(
+                            dirs[a:b], ens[a:b] * ((b - a) / n_total), src.position
+                        )
+                        self._emit_progress(
+                            progress_callback,
+                            0.15 + 0.70 * ((s + b / n_total) / max(1, n_sources)),
+                            f"Ray tracing source {s + 1}/{n_sources} "
+                            f"({b}/{n_total} rays)",
+                        )
             elif self.dim == 2:
                 if is_all_omni:
-                    self.room_engine.ray_tracing(n_rays, src.position)
+                    engine.ray_tracing(n_rays, src.position)
                 else:
                     raise NotImplementedError(
                         "Only omnidirectional sources are supported in 2D."
@@ -2343,14 +2442,18 @@ class Room(object):
             else:
                 raise ValueError(f"Dimension must 2 or 3 (got {self.dim}).")
 
+            if histograms is None:
+                # get a copy of the histograms
+                histograms = [
+                    [h.get_hist() for h in engine.microphones[e].histograms]
+                    for e in range(n_receivers)
+                ]
+                # reset all the receivers' histograms
+                engine.reset_mics()
+
             # There is one histogram for each mic/source pair.
             for r in range(self.mic_array.M):
-                self.rt_histograms[r].append([])
-                for h in self.room_engine.microphones[r].histograms:
-                    # get a copy of the histogram
-                    self.rt_histograms[r][s].append(h.get_hist())
-            # reset all the receivers' histograms
-            self.room_engine.reset_mics()
+                self.rt_histograms[r].append(list(histograms[receiver_of_mic[r]]))
 
             if self.dim != 3:
                 # The 2D path is not chunked; still report per-source progress.
@@ -2362,6 +2465,36 @@ class Room(object):
 
         # update the state
         self.simulator_state["rt_done"] = True
+
+    def _rt_receiver_groups(self):
+        """
+        Group the microphones into ray-tracing receivers.
+
+        Returns
+        -------
+        receiver_of_mic: list of int
+            Receiver index of each microphone, numbered in order of first use.
+        n_receivers: int
+        """
+        n_mics = self.mic_array.M
+        if not self.rt_args.get("share_coincident_mics", True) or not hasattr(
+            self, "_engine_args"
+        ):
+            return list(range(n_mics)), n_mics
+
+        groups = {}
+        receiver_of_mic = []
+        for r in range(n_mics):
+            directivity = self.mic_array.directivity[r]
+            if directivity is None:
+                grid = "omni"
+            elif isinstance(directivity, MeasuredDirectivity):
+                grid = ("measured", id(directivity))
+            else:
+                grid = "default"
+            key = (np.ascontiguousarray(self.mic_array.R[:, r]).tobytes(), grid)
+            receiver_of_mic.append(groups.setdefault(key, len(groups)))
+        return receiver_of_mic, len(groups)
 
     def compute_rir(self, progress_callback=None):
         """

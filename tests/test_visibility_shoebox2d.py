@@ -26,6 +26,7 @@ room = pra.Room.from_corners(
 )
 
 
+room.check_inside = True  # the last microphone is outside the room
 room.add_source([2, 2], None, 0)
 
 # place 3 microphones in the room

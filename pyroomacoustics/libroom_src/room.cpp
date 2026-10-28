@@ -322,25 +322,25 @@ bool Room<D>::is_visible_dfs(const Vectorf<D> &p, ImageSource<D> &is,
      True (1) :  visible
      */
 
-  if (is_obstructed_dfs(p, is)) return false;
-
   if (is.parent != NULL) {
     Vectorf<D> intersection;
 
     // get generating wall id
     int wall_id = is.gen_wall;
 
-    // check if the generating wall is intersected
+    // The source is not visible if the ray does not intersect the generating
+    // wall. Tested before the obstruction loop: it is one wall instead of all
+    // the obstructing ones, and it rejects most image sources by itself.
     int ret = walls[wall_id].intersection(p, is.loc, intersection);
+    if (ret < 0) return false;
 
-    // The source is not visible if the ray does not intersect
-    // the generating wall
-    if (ret >= 0)
-      // Check visibility of intersection point from parent source
-      return is_visible_dfs(intersection, *(is.parent), source_direction);
-    else
-      return false;
+    if (is_obstructed_dfs(p, is)) return false;
+
+    // Check visibility of intersection point from parent source
+    return is_visible_dfs(intersection, *(is.parent), source_direction);
   }
+
+  if (is_obstructed_dfs(p, is)) return false;
 
   // the source direction is the line between the original source and p
   // p is the intersection of the ray with the first reflection wall
@@ -758,6 +758,27 @@ bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
       continue;
     }
 
+    // As the ray is shot towards the microphone center,
+    // the hop dist can be easily computed
+    Vectorf<D> hit_point_to_mic = mic_pos - hit_point;
+    float hop_dist = hit_point_to_mic.norm();
+    float travel_dist_at_mic = travel_dist + hop_dist;
+
+    // compute the scattered energy reaching the microphone
+    double h_sq = hop_dist * hop_dist;
+    float p_hit_equal = 1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
+    // cosine angle should be positive, but could be negative if normal is
+    // facing out of room so we take abs
+    float p_lambert = 2 * std::abs(wall.cosine_angle(hit_point_to_mic));
+    Eigen::ArrayXf scat_trans = wall.scatter * transmitted * p_hit_equal * p_lambert;
+
+    // Below the thresholds nothing would be logged: skip the obstruction test,
+    // which loops over every obstructing wall for every microphone.
+    if (!(travel_dist_at_mic < distance_thres && scat_trans.maxCoeff() > energy_thres)) {
+      ret = false;
+      continue;
+    }
+
     // Prepare the output tupple of next_wall_hit()
     Vectorf<D> dont_care;
     int next_wall_index(-1);
@@ -767,40 +788,21 @@ bool Room<D>::scat_ray(const Eigen::ArrayXf &transmitted, const Wall<D> &wall,
       std::tie(dont_care, next_wall_index, hit_distance) =
           next_wall_hit(hit_point, mic_pos, true);
 
-    // If no wall obstructs the scattered ray
-    if (next_wall_index == -1) {
-      // As the ray is shot towards the microphone center,
-      // the hop dist can be easily computed
-      Vectorf<D> hit_point_to_mic = mic_pos - hit_point;
-      float hop_dist = hit_point_to_mic.norm();
-      float travel_dist_at_mic = travel_dist + hop_dist;
-
-      // compute the scattered energy reaching the microphone
-      double h_sq = hop_dist * hop_dist;
-      float p_hit_equal = 1.f - sqrt(1.f - mic_radius_sq / std::max(mic_radius_sq, h_sq));
-      // cosine angle should be positive, but could be negative if normal is
-      // facing out of room so we take abs
-      float p_lambert = 2 * std::abs(wall.cosine_angle(hit_point_to_mic));
-      Eigen::ArrayXf scat_trans = wall.scatter * transmitted * p_hit_equal * p_lambert;
-
-      // We add an entry to output and we increment the right element
-      // of scat_per_slot
-      if (travel_dist_at_mic < distance_thres && scat_trans.maxCoeff() > energy_thres)
-      {
-        // The (r_sq * p_hit) normalization factor is necessary to equalize the energy
-        // of the IR computed with ray tracing to that of the image source method.
-        // Ref: D. Schroeder, "Physically based real-time auralization of interactive virtual environments",
-        // section 5.4, eq. 5.54.
-        double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
-        auto p_hit =
-            (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
-        Eigen::ArrayXf energy = scat_trans / (r_sq * p_hit);
-        microphones[k].log_histogram(travel_dist_at_mic, energy, hit_point);
-      } else
-        ret = false;
-    } else {
-      ret = false;  // if a wall intersects the scattered ray, we return false
+    // if a wall intersects the scattered ray, we return false
+    if (next_wall_index != -1) {
+      ret = false;
+      continue;
     }
+
+    // The (r_sq * p_hit) normalization factor is necessary to equalize the energy
+    // of the IR computed with ray tracing to that of the image source method.
+    // Ref: D. Schroeder, "Physically based real-time auralization of interactive virtual environments",
+    // section 5.4, eq. 5.54.
+    double r_sq = double(travel_dist_at_mic) * travel_dist_at_mic;
+    auto p_hit =
+        (1 - sqrt(1 - mic_radius_sq / std::max(mic_radius_sq, r_sq)));
+    Eigen::ArrayXf energy = scat_trans / (r_sq * p_hit);
+    microphones[k].log_histogram(travel_dist_at_mic, energy, hit_point);
   }
 
   return ret;

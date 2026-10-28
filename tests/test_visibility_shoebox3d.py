@@ -26,6 +26,7 @@ room = pra.Room.from_corners(
 )
 
 room.extrude(6)
+room.check_inside = True  # the last microphone is outside the room
 
 room.add_source([3, 3, 3], None, 0)
 

@@ -121,6 +121,12 @@ def compute_ism_rir(
     min_phase=True,
     air_abs_coeffs=None,
 ):
+    # No image source (not even the direct path) reaches this microphone, e.g.
+    # it is shadowed by a wall. Checked before touching ``src.images``, which
+    # does not exist when the image source model found nothing at all.
+    if not np.any(is_visible):
+        return None
+
     fdl2 = fdl // 2
 
     images = src.images[:, is_visible]

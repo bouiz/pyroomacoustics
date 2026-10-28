@@ -11,9 +11,40 @@ adheres to `Semantic Versioning <http://semver.org/spec/v2.0.0.html>`_.
 `Unreleased`_
 -------------
 
+Added
+~~~~~
+
+- ``Room.set_ray_tracing(n_processes=...)`` splits the rays of every source over
+  worker processes (polygonal 3D rooms; ``pyroomacoustics.simulation.rt_parallel``).
+  The histograms are summed, so the result is statistically equivalent to a
+  single process.
+- ``Room.set_ray_tracing(share_coincident_mics=True)`` (default) traces
+  microphones that share a position and a direction grid, such as the channels
+  of an ambisonic microphone, as one receiver.
+
+Changed
+~~~~~~~
+
+- ``Room.check_inside`` (default ``False``) replaces the commented-out
+  inside-the-room checks: when set, sources outside the room are rejected and
+  microphones outside it hear nothing (upstream behaviour). Off by default
+  because open architectural meshes make the inside test unreliable.
+- SOFA files are read with ``h5py`` instead of ``python-sofa`` (unmaintained,
+  and it pulls ``netCDF4``, a second HDF5 copy, ``cftime``, ``DateTime`` and
+  ``zope.interface``). Values are read raw: netCDF fill values and packing are
+  not applied, which no bundled SOFA file uses.
+- Ray tracing and the image source model run their cheap per-microphone test
+  before the loop over obstructing walls (energy and distance thresholds of a
+  scattered ray; crossing of the generating wall). Results are bit-identical;
+  extra microphones in non-convex rooms become almost free.
+
 Fixed
 ~~~~~
 
+- Multi-process ray tracing: a process that used the pool no longer hangs on
+  exit waiting for its idle workers.
+- ``compute_ism_rir`` returns ``None`` instead of raising when no image source
+  is visible from a microphone.
 - `spiral_2D_array` now correctly uses the ``center`` parameter. Previously, it always returned the array at the origin. (`#413 <https://github.com/LCAV/pyroomacoustics/issues/413>`_).
 
 

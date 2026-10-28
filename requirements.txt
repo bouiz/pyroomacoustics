@@ -6,5 +6,5 @@ matplotlib
 sounddevice
 samplerate
 mir_eval
-python-sofa
+h5py
 soxr
